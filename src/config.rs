@@ -4,8 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub boil_account: String,
-    pub boil_password: String,
+    pub boil_api_token: String,
     pub tg_token: Option<String>,
     pub tg_chat_id: Option<String>,
     /// 定时换 IP 的 cron 表达式（5字段），None 表示不启用
@@ -76,27 +75,28 @@ fn setup_save_path() -> PathBuf {
     }
 }
 
-/// 构建配置文件内容：始终用新账密，保留已有 CHANGE_CRON；
+/// 构建配置文件内容：始终用新 token，保留已有 CHANGE_CRON；
 /// tg 为 Some 时写入新 TG 配置（覆盖旧的），为 None 时保留已有 TG 配置。
 /// 关键：旧 TG 行不会与新行并存，避免 dotenvy「同名 key 取第一个」导致新配置失效。
-fn build_config_content(existing: &str, account: &str, password: &str, tg: Option<(&str, &str)>) -> String {
+fn build_config_content(
+    existing: &str,
+    token: &str,
+    tg: Option<(&str, &str)>,
+) -> String {
     let cron_line: String = existing
         .lines()
         .find(|l| l.starts_with("CHANGE_CRON="))
         .map(|l| format!("{l}\n"))
         .unwrap_or_default();
 
-    let mut content = format!(
-        "BOIL_ACCOUNT='{}'\nBOIL_PASSWORD='{}'\n{}",
-        account,
-        password.replace('\'', "'\\''"),
-        cron_line,
-    );
+    let mut content = format!("BOIL_API_TOKEN='{}'\n{}", token, cron_line);
 
     match tg {
         // 写入新 TG 配置，旧的丢弃
-        Some((token, chat_id)) => {
-            content.push_str(&format!("TG_TOKEN='{token}'\nTG_CHAT_ID='{chat_id}'\n"));
+        Some((tg_token, chat_id)) => {
+            content.push_str(&format!(
+                "TG_TOKEN='{tg_token}'\nTG_CHAT_ID='{chat_id}'\n"
+            ));
         }
         // 未配置 TG：原样保留已有 TG 行
         None => {
@@ -119,8 +119,16 @@ pub fn load() -> anyhow::Result<Config> {
     dotenvy::dotenv().ok();
 
     Ok(Config {
-        boil_account: std::env::var("BOIL_ACCOUNT").context("缺少 BOIL_ACCOUNT 配置")?,
-        boil_password: std::env::var("BOIL_PASSWORD").context("缺少 BOIL_PASSWORD 配置")?,
+        boil_api_token: std::env::var("BOIL_API_TOKEN")
+            .or_else(|_| {
+                // 兼容旧配置：自动从 BOIL_ACCOUNT/BOIL_PASSWORD 迁移提示
+                std::env::var("BOIL_ACCOUNT").map(|_| String::new())
+            })
+            .context(
+                "缺少 BOIL_API_TOKEN 配置\n\
+                 请前往 https://ippanel.boil.network/ 登录后点击「獲取API」生成 Token，\
+                 然后运行 boil setup 重新配置",
+            )?,
         tg_token: std::env::var("TG_TOKEN").ok(),
         tg_chat_id: std::env::var("TG_CHAT_ID").ok(),
         change_cron: std::env::var("CHANGE_CRON").ok(),
@@ -128,8 +136,20 @@ pub fn load() -> anyhow::Result<Config> {
 }
 
 pub async fn load_or_setup() -> anyhow::Result<Config> {
+    // 清理旧版残留文件（v1 session cookie 在新版 Bearer Token 下已无用）
+    cleanup_old_artifacts();
+
     match load() {
-        Ok(cfg) => Ok(cfg),
+        Ok(cfg) => {
+            // 检查是否从旧配置迁移过来的空 token
+            if cfg.boil_api_token.is_empty() {
+                println!("检测到旧版配置（BOIL_ACCOUNT/BOIL_PASSWORD），新版已改用 API Token。");
+                println!("请前往 https://ippanel.boil.network/ 登录后点击「獲取API」生成 Token。\n");
+                run_setup_wizard().await?;
+                return load();
+            }
+            Ok(cfg)
+        }
         Err(_) => {
             println!("未找到配置，启动首次配置向导...\n");
             run_setup_wizard().await?;
@@ -138,49 +158,49 @@ pub async fn load_or_setup() -> anyhow::Result<Config> {
     }
 }
 
-pub async fn run_setup_wizard() -> anyhow::Result<()> {
-    let account: String = Input::new()
-        .with_prompt("Boil 账号（邮箱）")
-        .interact_text()?;
+/// 清理 v1 旧版残留文件（session.cookie 等），静默执行，不存在则跳过。
+fn cleanup_old_artifacts() {
+    for dir in ["/etc/boil", "."] {
+        let cookie_path = std::path::PathBuf::from(dir).join("session.cookie");
+        if cookie_path.exists() {
+            let _ = std::fs::remove_file(&cookie_path);
+            log::info!("已清理旧版残留: {:?}", cookie_path);
+        }
+    }
+}
 
-    let password: String = Password::new()
-        .with_prompt("Boil 密码")
+pub async fn run_setup_wizard() -> anyhow::Result<()> {
+    println!("请前往 https://ippanel.boil.network/ 登录后点击「獲取API」获取 Token。\n");
+
+    let token: String = Password::new()
+        .with_prompt("Boil API Token")
         .interact()?;
 
-    println!("\n测试登录中...");
-    let client = crate::boil::BoilClient::new()?;
-    client
-        .login(&account, &password)
-        .await
-        .context("登录失败，请检查账号密码")?;
-
-    let data = client.query_all_authed(&account, &password).await?;
-    println!("✅ 登录成功，找到以下服务器：\n");
-    for item in &data.zone_items {
-        let ip = data.get_ip(&item.router_id, &item.interface).unwrap_or("未知");
-        let tag = if item.nat_no_change { "NAT 不可换" } else { "可换 IP ✅" };
-        println!("  {} | IP: {} | {}", item.label, ip, tag);
+    println!("\n验证 Token 中...");
+    let client = crate::boil::BoilClient::new(&token)?;
+    match client.get_ip().await {
+        Ok(resp) => println!("✅ Token 验证成功，当前 IP: {}\n", resp.ip),
+        Err(e) => {
+            anyhow::bail!("Token 验证失败: {e}\n请检查 Token 是否正确，是否已过期");
+        }
     }
-    println!();
 
-    // 登录成功后立即保存 Boil 账密（保留已有的 CHANGE_CRON 与 TG 配置）
+    // 保存 token（保留已有的 CHANGE_CRON 与 TG 配置）
     let save_path = setup_save_path();
     let existing = std::fs::read_to_string(&save_path).unwrap_or_default();
-    std::fs::write(
-        &save_path,
-        build_config_content(&existing, &account, &password, None),
-    )?;
-    println!("✅ 账号已保存到 {}\n", save_path.display());
+    std::fs::write(&save_path, build_config_content(&existing, &token, None))?;
+    println!("✅ Token 已保存到 {}\n", save_path.display());
 
     // TG 可选
     let want_tg = Select::new()
         .with_prompt("配置 Telegram Bot（用于远程控制）")
         .items(&["是，现在配置", "否，跳过（之后可用 boil setup 补充）"])
         .default(0)
-        .interact()? == 0;
+        .interact()?
+        == 0;
 
     if want_tg {
-        let token: String = Input::new()
+        let tg_token: String = Input::new()
             .with_prompt("Bot Token（从 @BotFather 获取）")
             .interact_text()?;
 
@@ -190,7 +210,7 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
                 .allow_empty(true)
                 .interact_text()?;
 
-            match detect_chat_id(&token).await {
+            match detect_chat_id(&tg_token).await {
                 Ok(id) => {
                     println!("✅ 检测到 chat_id: {id}\n");
                     break id;
@@ -204,7 +224,7 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
         // 用新 TG 配置覆盖写入（替换旧的，避免重复 key 导致新配置不生效）
         std::fs::write(
             &save_path,
-            build_config_content(&existing, &account, &password, Some((token.as_str(), chat_id.as_str()))),
+            build_config_content(&existing, &token, Some((tg_token.as_str(), chat_id.as_str()))),
         )?;
         println!("✅ TG 配置已保存\n");
     } else {
@@ -218,10 +238,10 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn detect_chat_id(token: &str) -> anyhow::Result<String> {
+async fn detect_chat_id(tg_token: &str) -> anyhow::Result<String> {
     let url = format!(
         "https://api.telegram.org/bot{}/getUpdates?offset=-1&limit=1",
-        token
+        tg_token
     );
     let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
     resp["result"][0]["message"]["from"]["id"]
@@ -237,40 +257,33 @@ mod tests {
     /// 复现并验证修复：重新配置 TG 时不应产生重复的 TG_ 行，且新值生效。
     #[test]
     fn reconfigure_tg_no_duplicate() {
-        let existing = "BOIL_ACCOUNT='old@x.com'\nBOIL_PASSWORD='oldpw'\nTG_TOKEN='oldtoken'\nTG_CHAT_ID='111'\n";
-        let out = build_config_content(existing, "new@x.com", "newpw", Some(("newtoken", "222")));
+        let existing =
+            "BOIL_API_TOKEN='oldtoken'\nTG_TOKEN='oldtg'\nTG_CHAT_ID='111'\n";
+        let out = build_config_content(existing, "newtoken", Some(("newtg", "222")));
 
-        // 修复前：旧 TG 行被保留 + 新 TG 行被追加 → 各出现两次，dotenvy 取旧值
         assert_eq!(out.matches("TG_TOKEN=").count(), 1, "TG_TOKEN 应只出现一次");
         assert_eq!(out.matches("TG_CHAT_ID=").count(), 1, "TG_CHAT_ID 应只出现一次");
-        assert!(out.contains("TG_TOKEN='newtoken'"));
+        assert!(out.contains("TG_TOKEN='newtg'"));
         assert!(out.contains("TG_CHAT_ID='222'"));
-        assert!(!out.contains("oldtoken"), "旧 token 不应残留");
-        assert!(out.contains("BOIL_ACCOUNT='new@x.com'"));
+        assert!(!out.contains("oldtg"), "旧 TG token 不应残留");
+        assert!(out.contains("BOIL_API_TOKEN='newtoken'"));
     }
 
     /// 跳过 TG 配置时，应保留已有的 TG 配置。
     #[test]
     fn skip_tg_keeps_existing() {
-        let existing = "BOIL_ACCOUNT='o'\nBOIL_PASSWORD='p'\nTG_TOKEN='keep'\nTG_CHAT_ID='1'\n";
-        let out = build_config_content(existing, "a", "b", None);
+        let existing = "BOIL_API_TOKEN='t'\nTG_TOKEN='keep'\nTG_CHAT_ID='1'\n";
+        let out = build_config_content(existing, "t2", None);
         assert!(out.contains("TG_TOKEN='keep'"));
         assert_eq!(out.matches("TG_TOKEN=").count(), 1);
     }
 
-    /// 重配账密/TG 时，已有的 CHANGE_CRON 定时设置应被保留。
+    /// 重配 Token/TG 时，已有的 CHANGE_CRON 定时设置应被保留。
     #[test]
     fn keeps_cron_when_configuring_tg() {
-        let existing = "BOIL_ACCOUNT='o'\nBOIL_PASSWORD='p'\nCHANGE_CRON='0 */6 * * *'\n";
-        let out = build_config_content(existing, "a", "b", Some(("t", "c")));
+        let existing = "BOIL_API_TOKEN='t'\nCHANGE_CRON='0 */6 * * *'\n";
+        let out = build_config_content(existing, "t2", Some(("tg", "c")));
         assert!(out.contains("CHANGE_CRON='0 */6 * * *'"));
         assert_eq!(out.matches("CHANGE_CRON=").count(), 1);
-    }
-
-    /// 密码含单引号时应被正确转义。
-    #[test]
-    fn escapes_single_quote_in_password() {
-        let out = build_config_content("", "a@b.com", "pa'ss", None);
-        assert!(out.contains(r"BOIL_PASSWORD='pa'\''ss'"));
     }
 }

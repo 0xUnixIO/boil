@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::time::sleep;
 
-use crate::{boil::{BoilClient, QueryAllResponse}, config::Config};
+use crate::boil::BoilClient;
 
 pub struct IpQuality {
     pub country: String,
@@ -13,10 +13,20 @@ pub struct IpQuality {
 
 impl IpQuality {
     pub fn cf_risk(&self) -> &'static str {
-        if self.is_proxy || self.is_hosting { "高 ⚠️" } else { "低 ✅" }
+        if self.is_proxy || self.is_hosting {
+            "高 ⚠️"
+        } else {
+            "低 ✅"
+        }
     }
     pub fn ip_type(&self) -> &'static str {
-        if self.is_proxy { "代理 ❌" } else if self.is_hosting { "机房 ⚠️" } else { "住宅 ✅" }
+        if self.is_proxy {
+            "代理 ❌"
+        } else if self.is_hosting {
+            "机房 ⚠️"
+        } else {
+            "住宅 ✅"
+        }
     }
 }
 
@@ -27,48 +37,37 @@ pub struct ReconnectResult {
     pub quality: Option<IpQuality>,
 }
 
-pub async fn do_reconnect(
-    config: &Config,
-    router_id: &str,
-    interface: &str,
-    pre_data: Option<QueryAllResponse>,
-) -> anyhow::Result<ReconnectResult> {
-    let c = BoilClient::new()?;
-    let data = match pre_data {
-        Some(d) => d,
-        None => c.query_all_authed(&config.boil_account, &config.boil_password).await?,
-    };
-    let old_ip = data.get_ip(router_id, interface).map(str::to_string);
+/// 执行换 IP 并等待新 IP 生效
+pub async fn do_reconnect(client: &BoilClient) -> anyhow::Result<ReconnectResult> {
+    // 获取旧 IP
+    let old_ip = client
+        .get_ip()
+        .await
+        .ok()
+        .map(|r| r.ip);
 
-    anyhow::ensure!(
-        data.daily_limit == 0 || data.daily_used < data.daily_limit,
-        "今日额度已用尽（{}/{}），明日再试",
-        data.daily_used,
-        data.daily_limit
-    );
-
-    c.reconnect(router_id, interface).await?;
+    // 触发换 IP
+    client.change_ip().await?;
     sleep(Duration::from_secs(8)).await;
 
+    // 轮询直到 IP 变化
     let mut new_ip: Option<String> = None;
     for _ in 0..10u8 {
-        // 服务器限流阈值约 5 秒，轮询间隔用 6 秒保持安全余量
         sleep(Duration::from_secs(6)).await;
-        let d2 = match c.query_all().await {
-            Ok(d) => d,
+        match client.get_ip().await {
+            Ok(resp) => {
+                if Some(&resp.ip) != old_ip.as_ref() {
+                    new_ip = Some(resp.ip);
+                    break;
+                }
+            }
             Err(e) => {
-                // 遇到限流直接跳过本轮，外层 sleep 会提供缓冲
                 if crate::boil::is_rate_limited(&e) {
-                    log::warn!("轮询 query_all 限流，跳过本轮: {e}");
+                    log::warn!("轮询 getIP 限流，跳过本轮: {e}");
                     continue;
                 }
                 return Err(e);
             }
-        };
-        let ip = d2.get_ip(router_id, interface).map(str::to_string);
-        if ip.is_some() && ip != old_ip {
-            new_ip = ip;
-            break;
         }
     }
 
@@ -77,7 +76,12 @@ pub async fn do_reconnect(
         None => (false, None),
     };
 
-    Ok(ReconnectResult { old_ip, new_ip, reachable, quality })
+    Ok(ReconnectResult {
+        old_ip,
+        new_ip,
+        reachable,
+        quality,
+    })
 }
 
 pub async fn check_ip_quality(ip: &str) -> Option<IpQuality> {

@@ -1,51 +1,42 @@
-use dialoguer::Select;
-
-use crate::{boil::BoilClient, config::{save_cron, validate_cron, Config}, core::{check_ip_quality, check_reachable, do_reconnect}};
+use crate::{
+    boil::BoilClient,
+    config::{save_cron, validate_cron, Config},
+    core::{check_ip_quality, check_reachable, do_reconnect},
+};
 
 pub async fn cmd_status(config: &Config) -> anyhow::Result<()> {
-    let c = BoilClient::new()?;
-    let data = c.query_all_authed(&config.boil_account, &config.boil_password).await?;
-
-    println!("📡 服务器状态 | 今日换 IP {}/{} 次\n", data.daily_used, data.daily_limit);
-    for item in &data.zone_items {
-        let ip = data.get_ip(&item.router_id, &item.interface).unwrap_or("未知");
-        let tag = if item.nat_no_change { "🔒 NAT" } else { "✅ 可换" };
-        println!("  {}\n  IP: {}  {}\n", item.label, ip, tag);
-    }
+    let c = BoilClient::new(&config.boil_api_token)?;
+    let resp = c.get_ip().await?;
+    println!("📡 当前 IP: {}", resp.ip);
     Ok(())
 }
 
 pub async fn cmd_check(config: &Config) -> anyhow::Result<()> {
-    let c = BoilClient::new()?;
-    let data = c.query_all_authed(&config.boil_account, &config.boil_password).await?;
+    let c = BoilClient::new(&config.boil_api_token)?;
+    let resp = c.get_ip().await?;
+    let ip = &resp.ip;
 
-    for item in data.changeable() {
-        let ip = match data.get_ip(&item.router_id, &item.interface) {
-            Some(ip) => ip.to_string(),
-            None => continue,
-        };
-        let (reachable, quality) = tokio::join!(check_reachable(&ip), check_ip_quality(&ip));
-        let reach = if reachable { "TCP 可达 ✅" } else { "TCP 未通 ⚠️" };
-        println!("📍 {}\n   IP: {}  {}", item.label, ip, reach);
-        if let Some(q) = quality {
-            println!(
-                "   地区: {} | ISP: {}\n   类型: {} | CF 风险: {}",
-                q.country, q.isp, q.ip_type(), q.cf_risk()
-            );
-        }
-        println!();
+    let (reachable, quality) = tokio::join!(check_reachable(ip), check_ip_quality(ip));
+    let reach = if reachable {
+        "TCP 可达 ✅"
+    } else {
+        "TCP 未通 ⚠️"
+    };
+    println!("📍 IP: {}  {}", ip, reach);
+    if let Some(q) = quality {
+        println!(
+            "   地区: {} | ISP: {}\n   类型: {} | CF 风险: {}",
+            q.country,
+            q.isp,
+            q.ip_type(),
+            q.cf_risk()
+        );
     }
+    println!();
 
     // 流媒体检测需要从 Boil VPS 的 IP 发出，先对比本机公网 IP
-    // 用全部服务器（含 NAT 不可换）的 IP 比对，否则本机若是 NAT 机会被误判
-    let boil_ips: Vec<String> = data.zone_items
-        .iter()
-        .filter_map(|r| data.get_ip(&r.router_id, &r.interface))
-        .map(str::to_string)
-        .collect();
-
     let local_ip = get_local_public_ip().await;
-    let on_boil_vps = local_ip.as_deref().map(|ip| boil_ips.iter().any(|b| b == ip)).unwrap_or(false);
+    let on_boil_vps = local_ip.as_deref() == Some(ip.as_str());
 
     if on_boil_vps {
         println!("📺 流媒体检测中...");
@@ -64,8 +55,17 @@ pub async fn cmd_check(config: &Config) -> anyhow::Result<()> {
 async fn get_local_public_ip() -> Option<String> {
     let client = reqwest::Client::new();
     // 多源兜底：单一服务超时/被墙时仍能拿到本机公网 IP，避免误判为非 VPS
-    for url in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"] {
-        if let Ok(resp) = client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
+    for url in [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ] {
+        if let Ok(resp) = client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
             if let Ok(text) = resp.text().await {
                 let ip = text.trim().to_string();
                 if !ip.is_empty() {
@@ -78,42 +78,18 @@ async fn get_local_public_ip() -> Option<String> {
 }
 
 pub async fn cmd_change(config: &Config) -> anyhow::Result<()> {
-    let c = BoilClient::new()?;
-    let data = c.query_all_authed(&config.boil_account, &config.boil_password).await?;
+    let c = BoilClient::new(&config.boil_api_token)?;
 
-    let changeable = data.changeable();
-    if changeable.is_empty() {
-        println!("⚠️  没有可换 IP 的服务器");
-        return Ok(());
-    }
-
-    let target = if changeable.len() == 1 {
-        changeable[0]
-    } else {
-        let labels: Vec<String> = changeable
-            .iter()
-            .map(|r| {
-                let ip = data.get_ip(&r.router_id, &r.interface).unwrap_or("未知");
-                format!("{} ({})", r.label, ip)
-            })
-            .collect();
-        let idx = Select::new()
-            .with_prompt("选择要换 IP 的服务器")
-            .items(&labels)
-            .default(0)
-            .interact()?;
-        changeable[idx]
-    };
-
-    let router_id = target.router_id.clone();
-    let interface = target.interface.clone();
-    drop(changeable);
     println!("⏳ 换 IP 中...");
-    let res = do_reconnect(config, &router_id, &interface, Some(data)).await?;
+    let res = do_reconnect(&c).await?;
 
     match res.new_ip {
         Some(new_ip) => {
-            let reach = if res.reachable { "TCP 可达 ✅" } else { "TCP 未通 ⚠️" };
+            let reach = if res.reachable {
+                "TCP 可达 ✅"
+            } else {
+                "TCP 未通 ⚠️"
+            };
             println!(
                 "\n✅ 换 IP 完成\n   旧 IP: {}\n   新 IP: {}  {}\n",
                 res.old_ip.as_deref().unwrap_or("未知"),
@@ -142,7 +118,9 @@ pub fn cmd_timer(config: &Config, arg: &str) -> anyhow::Result<()> {
     if arg.is_empty() {
         match &config.change_cron {
             Some(cron) => println!("⏰ 当前定时换 IP: {cron}\n\n关闭: boil timer off"),
-            None => println!("⏰ 定时换 IP 未启用\n\n设置示例:\n  每6小时: boil timer \"0 */6 * * *\"\n  每天3点: boil timer \"0 3 * * *\""),
+            None => println!(
+                "⏰ 定时换 IP 未启用\n\n设置示例:\n  每6小时: boil timer \"0 */6 * * *\"\n  每天3点: boil timer \"0 3 * * *\""
+            ),
         }
         return Ok(());
     }

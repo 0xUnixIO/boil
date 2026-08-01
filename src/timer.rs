@@ -19,7 +19,12 @@ impl TimerManager {
     pub async fn new(config: Arc<Config>) -> anyhow::Result<Self> {
         let sched = JobScheduler::new().await?;
         sched.start().await?;
-        Ok(Self { sched, config, job_id: None, current: None })
+        Ok(Self {
+            sched,
+            config,
+            job_id: None,
+            current: None,
+        })
     }
 
     /// 当前生效的 cron 表达式
@@ -35,12 +40,16 @@ impl TimerManager {
         let full_expr = format!("0 {}", expr.trim());
         let cfg = self.config.clone();
         // 按北京时间（Asia/Shanghai）解析 cron，否则默认走 UTC，"3 点" 会变成北京 11 点
-        let job = Job::new_async_tz(&full_expr, chrono_tz::Asia::Shanghai, move |_uuid, _lock| {
-            let cfg = cfg.clone();
-            Box::pin(async move {
-                run_auto_change(&cfg).await;
-            })
-        })?;
+        let job = Job::new_async_tz(
+            &full_expr,
+            chrono_tz::Asia::Shanghai,
+            move |_uuid, _lock| {
+                let cfg = cfg.clone();
+                Box::pin(async move {
+                    run_auto_change(&cfg).await;
+                })
+            },
+        )?;
 
         self.job_id = Some(self.sched.add(job).await?);
         self.current = Some(expr.trim().to_string());
@@ -71,28 +80,31 @@ pub async fn start(config: Arc<Config>) -> anyhow::Result<TimerManager> {
 }
 
 async fn run_auto_change(config: &Config) {
-    let c = match BoilClient::new() {
+    let c = match BoilClient::new(&config.boil_api_token) {
         Ok(c) => c,
-        Err(e) => { log::error!("定时换 IP 失败: {e}"); return; }
-    };
-    let data = match c.query_all_authed(&config.boil_account, &config.boil_password).await {
-        Ok(d) => d,
-        Err(e) => { log::error!("定时换 IP 查询失败: {e}"); return; }
-    };
-    let target = match data.changeable().first().map(|r| (r.router_id.clone(), r.interface.clone())) {
-        Some(t) => t,
-        None => { log::warn!("定时换 IP：没有可换 IP 的服务器"); return; }
+        Err(e) => {
+            log::error!("定时换 IP 失败: {e}");
+            return;
+        }
     };
 
-    log::info!("定时换 IP 触发: {}/{}", target.0, target.1);
+    log::info!("定时换 IP 触发");
 
-    match do_reconnect(config, &target.0, &target.1, Some(data)).await {
+    match do_reconnect(&c).await {
         Ok(res) => {
             let msg = match &res.new_ip {
                 Some(new_ip) => {
-                    let quality_info = res.quality.as_ref().map(|q| {
-                        format!("\n类型: {} | CF 风险: {}", q.ip_type(), q.cf_risk())
-                    }).unwrap_or_default();
+                    let quality_info = res
+                        .quality
+                        .as_ref()
+                        .map(|q| {
+                            format!(
+                                "\n类型: {} | CF 风险: {}",
+                                q.ip_type(),
+                                q.cf_risk()
+                            )
+                        })
+                        .unwrap_or_default();
                     format!(
                         "⏰ 定时换 IP 完成\n旧 IP: {}\n新 IP: {}{}",
                         res.old_ip.as_deref().unwrap_or("未知"),
